@@ -1,7 +1,8 @@
 //! The always-on part: per-device detectors feeding one shared double-press state machine.
 
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -17,6 +18,8 @@ const CONFIRM: f64 = 0.15; // seconds after an onset to see the bell's spectral 
 const MIN_GAP: f64 = 0.15; // strikes closer than this count as one (also dedupes multiple mics)
 const DOUBLE_WINDOW: f64 = 1.2; // max seconds between the two presses
 const COOLDOWN: f64 = 15.0; // seconds before another ship can start
+const STALL_SECS: u64 = 3; // a stream that delivers no audio for this long is reopened
+const RESCAN_SECS: u32 = 5; // how often to look for calibrated devices that aren't open yet
 // -----------------------------------------------------------------------------
 
 /// f32 shared between the audio thread and the main thread.
@@ -36,6 +39,7 @@ impl AtomicF32 {
 struct Stats {
     peak: AtomicF32,     // loudest block since the last debug readout
     max_seen: AtomicF32, // loudest block ever (to spot dead/muted mics)
+    last_block_ms: AtomicU64, // when the last block arrived (ms since start), to spot stalled streams
 }
 
 struct State {
@@ -119,6 +123,7 @@ struct Detector {
 impl Detector {
     fn process(&mut self, block: &[f32]) {
         let now = self.start.elapsed().as_secs_f64();
+        self.stats.last_block_ms.store((now * 1000.0) as u64, Ordering::Relaxed);
         let rms = dsp::rms(block);
         self.stats.peak.store(self.stats.peak.load().max(rms));
         self.stats.max_seen.store(self.stats.max_seen.load().max(rms));
@@ -171,21 +176,104 @@ pub fn run(args: &[String], settings: Option<Settings>) -> Result<(), String> {
     });
     let start = Instant::now();
 
-    let mut streams = Vec::new();
-    let mut all_stats: Vec<(usize, String, Arc<Stats>)> = Vec::new();
+    // One open stream per calibrated device. A device that isn't there yet (a wireless
+    // headset still connecting after boot) is picked up by the rescan below; a stream that
+    // stops delivering audio is dropped and reopened.
+    let mut slots: HashMap<String, Slot> = HashMap::new();
+    let mut reported: HashSet<String> = HashSet::new();
     println!("Opening input devices:");
-    for input in audio::inputs(only).map_err(|e| e.to_string())? {
+    open_missing(&cfg, only, &shared, start, debug, &mut slots, &mut reported);
+    if slots.is_empty() {
+        println!("No calibrated input device is available yet. Waiting for one (run orderup calibrate, or check --list-devices).");
+    }
+
+    println!("Ready (cooldown={COOLDOWN}s, dry={dry}). Ctrl+C to stop.");
+    let mut seconds = 0u32;
+    loop {
+        thread::sleep(Duration::from_secs(1));
+        seconds += 1;
+        let now_ms = start.elapsed().as_millis() as u64;
+
+        slots.retain(|name, slot| {
+            let idle = now_ms.saturating_sub(slot.stats.last_block_ms.load(Ordering::Relaxed));
+            if idle > STALL_SECS * 1000 {
+                println!("[{name}] stopped delivering audio; reopening");
+                reported.remove(name);
+                false
+            } else {
+                true
+            }
+        });
+        if seconds % RESCAN_SECS == 0 {
+            open_missing(&cfg, only, &shared, start, debug, &mut slots, &mut reported);
+        }
+
+        if debug {
+            let levels: Vec<String> = slots
+                .values()
+                .map(|s| format!("[{}]={:.4}", s.index, s.stats.peak.load()))
+                .collect();
+            println!("level (max rms last second): {}", levels.join("  "));
+            slots.values().for_each(|s| s.stats.peak.store(0.0));
+        }
+        for (name, slot) in &mut slots {
+            slot.age += 1;
+            if slot.age == 5 && slot.stats.max_seen.load() == 0.0 {
+                println!("note: [{}] {name} is delivering pure silence (muted or blocked); the other devices still work", slot.index);
+            }
+        }
+    }
+}
+
+struct Slot {
+    index: usize,
+    stats: Arc<Stats>,
+    age: u32, // seconds since opened
+    _stream: cpal::Stream,
+}
+
+/// Opens every calibrated input device that isn't open yet. Reasons for skipping a device
+/// are printed once, not on every rescan.
+fn open_missing(
+    cfg: &profile::Config,
+    only: Option<usize>,
+    shared: &Arc<Shared>,
+    start: Instant,
+    debug: bool,
+    slots: &mut HashMap<String, Slot>,
+    reported: &mut HashSet<String>,
+) {
+    const ENUM_KEY: &str = "<enumeration>";
+    let inputs = match audio::inputs(only) {
+        Ok(i) => i,
+        Err(e) => {
+            if reported.insert(ENUM_KEY.to_string()) {
+                println!("  can't list input devices: {e}");
+            }
+            return;
+        }
+    };
+    reported.remove(ENUM_KEY);
+    for input in inputs {
+        if slots.contains_key(&input.name) {
+            continue;
+        }
         let Some(prof) = cfg.devices.get(&input.name) else {
-            println!("  skipped [{}] {}: no calibration profile (run orderup calibrate with it connected)",
-                input.index, input.name);
+            if reported.insert(input.name.clone()) {
+                println!("  skipped [{}] {}: no calibration profile (run orderup calibrate with it connected)",
+                    input.index, input.name);
+            }
             continue;
         };
         if prof.sr != input.sr {
-            println!("  skipped [{}] {}: calibrated at {} Hz but the device now runs at {} Hz; recalibrate",
-                input.index, input.name, prof.sr, input.sr);
+            if reported.insert(input.name.clone()) {
+                println!("  skipped [{}] {}: calibrated at {} Hz but the device now runs at {} Hz; recalibrate",
+                    input.index, input.name, prof.sr, input.sr);
+            }
             continue;
         }
         let stats = Arc::new(Stats::default());
+        stats.last_block_ms.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
         let mut det = Detector {
             label: format!("[{}] {}", input.index, input.name),
             index: input.index,
@@ -204,33 +292,11 @@ pub fn run(args: &[String], settings: Option<Settings>) -> Result<(), String> {
             Ok(stream) => {
                 println!("  listening on [{}] {}  (sim>{} tonal>{} min_rms={})", input.index,
                     input.name, prof.sim_t, prof.tonal_t, prof.min_rms);
-                streams.push(stream);
-                all_stats.push((input.index, input.name.clone(), stats));
+                slots.insert(input.name.clone(), Slot { index: input.index, stats, age: 0, _stream: stream });
             }
-            Err(e) => println!("  skipped [{}] {}: {e}", input.index, input.name),
-        }
-    }
-    if streams.is_empty() {
-        return Err("No calibrated input device is available. Run orderup calibrate, or check --list-devices.".into());
-    }
-
-    println!("Ready (cooldown={COOLDOWN}s, dry={dry}). Ctrl+C to stop.");
-    let mut seconds = 0u32;
-    loop {
-        thread::sleep(Duration::from_secs(1));
-        seconds += 1;
-        if debug {
-            let levels: Vec<String> = all_stats
-                .iter()
-                .map(|(i, _, s)| format!("[{i}]={:.4}", s.peak.load()))
-                .collect();
-            println!("level (max rms last second): {}", levels.join("  "));
-            all_stats.iter().for_each(|(_, _, s)| s.peak.store(0.0));
-        }
-        if seconds == 5 {
-            for (i, name, s) in &all_stats {
-                if s.max_seen.load() == 0.0 {
-                    println!("note: [{i}] {name} is delivering pure silence (muted or blocked); the other devices still work");
+            Err(e) => {
+                if reported.insert(input.name.clone()) {
+                    println!("  skipped [{}] {}: {e}", input.index, input.name);
                 }
             }
         }
