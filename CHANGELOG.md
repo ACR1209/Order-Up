@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/ACR1209/Order-Up/compare/v0.1.0...v0.1.1) (2026-11-03)
+
+
+### Bug Fixes
+
+* reopen stalled or late audio devices ([c620570](https://github.com/ACR1209/Order-Up/commit/c6205704ffc3e3f1862925556c214315d42e0c19))
+
 ## 0.1.0 (2026-11-03)
 
 
