@@ -56,7 +56,7 @@ fn run_listener(args: &[String]) -> Result<(), String> {
             }
             // Never set up: walk through the wizard (can't do that with no console).
             None if !background => {
-                println!("orderup isn't set up yet, so here is the setup wizard.\n");
+                println!("Welcome to Order Up! Let's get you set up.\n");
                 return setup::run(args);
             }
             None => return Err("not set up: run `orderup setup`".into()),
