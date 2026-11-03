@@ -1,22 +1,47 @@
 name: release
 
-# Push a tag like v0.1.0 to build orderup.exe and attach it to a GitHub release.
+# Every push to main updates a "release PR" (version bump in Cargo.toml/Cargo.lock plus
+# CHANGELOG.md, worked out from conventional commit messages). Merging that PR makes
+# release-please create the tag and GitHub release; the build job then attaches orderup.exe.
+#
+# One workflow on purpose: a tag created with the default GITHUB_TOKEN doesn't trigger other
+# workflows, so a separate "on: push: tags" build would never run.
+#
+# One-time repo setting: Settings > Actions > General > Workflow permissions >
+# "Allow GitHub Actions to create and approve pull requests".
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
-  windows:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.rp.outputs.release_created }}
+      tag_name: ${{ steps.rp.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v5
+        id: rp
+        with:
+          release-type: rust
+
+  build:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
       - run: cargo test --release --locked
       - run: cargo build --release --locked
-      - name: Publish
+      - name: Attach orderup.exe to the release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" target/release/orderup.exe --generate-notes
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        run: gh release upload "$TAG" target/release/orderup.exe --clobber

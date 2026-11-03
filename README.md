@@ -55,5 +55,12 @@ cargo test --release
 ```
 
 The detection thresholds (`RISE`, `CONFIRM`, `DOUBLE_WINDOW`, `COOLDOWN`, ...) are constants at
-the top of `src/listen.rs`. Pushing a tag like `v0.1.0` runs `.github/workflows/release.yml`,
-which builds the exe and attaches it to a GitHub release.
+the top of `src/listen.rs`.
+
+### Releases
+
+Releases are automated with [release-please](https://github.com/googleapis/release-please).
+Write commit messages in the [conventional](https://www.conventionalcommits.org/) style
+(`feat: ...`, `fix: ...`, `feat!: ...` for breaking changes). Pushes to `main` keep a release PR
+up to date with the next version and changelog; merging it tags the release, and
+`.github/workflows/release.yml` builds `orderup.exe` and attaches it.
