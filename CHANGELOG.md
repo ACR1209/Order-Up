@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/ACR1209/Order-Up/compare/v0.1.1...v0.1.2) (2026-11-04)
+
+
+### Bug Fixes
+
+* log background runs and reopen silent audio streams ([3424ea9](https://github.com/ACR1209/Order-Up/commit/3424ea95b381cf3de0d4746ff88f4082037eee30))
+
 ## [0.1.1](https://github.com/ACR1209/Order-Up/compare/v0.1.0...v0.1.1) (2026-11-03)
 
 
