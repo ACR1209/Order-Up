@@ -20,6 +20,9 @@ const DOUBLE_WINDOW: f64 = 1.2; // max seconds between the two presses
 const COOLDOWN: f64 = 15.0; // seconds before another ship can start
 const STALL_SECS: u64 = 3; // a stream that delivers no audio for this long is reopened
 const RESCAN_SECS: u32 = 5; // how often to look for calibrated devices that aren't open yet
+const SILENT_SECS: u32 = 10; // a stream delivering exact digital silence this long is reopened
+const SILENT_RETRY_SECS: u32 = 60; // ...but not more often than this (a muted mic is silent legitimately)
+const STATUS_SECS: u32 = 60; // how often the log gets a line proving each mic is alive
 // -----------------------------------------------------------------------------
 
 /// f32 shared between the audio thread and the main thread.
@@ -37,6 +40,7 @@ impl AtomicF32 {
 
 #[derive(Default)]
 struct Stats {
+    sec_peak: AtomicF32, // loudest block since the main loop last looked (once a second)
     peak: AtomicF32,     // loudest block since the last debug readout
     max_seen: AtomicF32, // loudest block ever (to spot dead/muted mics)
     last_block_ms: AtomicU64, // when the last block arrived (ms since start), to spot stalled streams
@@ -125,6 +129,7 @@ impl Detector {
         let now = self.start.elapsed().as_secs_f64();
         self.stats.last_block_ms.store((now * 1000.0) as u64, Ordering::Relaxed);
         let rms = dsp::rms(block);
+        self.stats.sec_peak.store(self.stats.sec_peak.load().max(rms));
         self.stats.peak.store(self.stats.peak.load().max(rms));
         self.stats.max_seen.store(self.stats.max_seen.load().max(rms));
 
@@ -181,8 +186,10 @@ pub fn run(args: &[String], settings: Option<Settings>) -> Result<(), String> {
     // stops delivering audio is dropped and reopened.
     let mut slots: HashMap<String, Slot> = HashMap::new();
     let mut reported: HashSet<String> = HashSet::new();
+    // devices reopened for silence, with the second before which they won't be reopened again
+    let mut quarantine: HashMap<String, u32> = HashMap::new();
     println!("Opening input devices:");
-    open_missing(&cfg, only, &shared, start, debug, &mut slots, &mut reported);
+    open_missing(&cfg, only, &shared, start, debug, &mut slots, &mut reported, &quarantine, 0);
     if slots.is_empty() {
         println!("No calibrated input device is available yet. Waiting for one (run orderup calibrate, or check --list-devices).");
     }
@@ -194,18 +201,34 @@ pub fn run(args: &[String], settings: Option<Settings>) -> Result<(), String> {
         seconds += 1;
         let now_ms = start.elapsed().as_millis() as u64;
 
+        for slot in slots.values_mut() {
+            let p = slot.stats.sec_peak.load();
+            slot.stats.sec_peak.store(0.0);
+            slot.minute_peak = slot.minute_peak.max(p);
+            slot.silent = if p == 0.0 { slot.silent + 1 } else { 0 };
+        }
         slots.retain(|name, slot| {
             let idle = now_ms.saturating_sub(slot.stats.last_block_ms.load(Ordering::Relaxed));
             if idle > STALL_SECS * 1000 {
                 println!("[{name}] stopped delivering audio; reopening");
-                reported.remove(name);
-                false
+            } else if slot.silent >= SILENT_SECS {
+                println!("[{name}] has delivered pure silence for {SILENT_SECS}s; reopening");
+                quarantine.insert(name.clone(), seconds + SILENT_RETRY_SECS);
             } else {
-                true
+                return true;
             }
+            reported.remove(name);
+            false
         });
         if seconds % RESCAN_SECS == 0 {
-            open_missing(&cfg, only, &shared, start, debug, &mut slots, &mut reported);
+            open_missing(&cfg, only, &shared, start, debug, &mut slots, &mut reported, &quarantine, seconds);
+        }
+        if seconds % STATUS_SECS == 0 {
+            let levels: Vec<String> = slots
+                .values_mut()
+                .map(|s| format!("[{}]={:.4}", s.index, std::mem::take(&mut s.minute_peak)))
+                .collect();
+            println!("t={seconds}s alive, max rms last minute: {}", levels.join("  "));
         }
 
         if debug {
@@ -229,6 +252,8 @@ struct Slot {
     index: usize,
     stats: Arc<Stats>,
     age: u32, // seconds since opened
+    silent: u32, // consecutive seconds of exact digital silence
+    minute_peak: f32, // loudest block since the last status line
     _stream: cpal::Stream,
 }
 
@@ -242,6 +267,8 @@ fn open_missing(
     debug: bool,
     slots: &mut HashMap<String, Slot>,
     reported: &mut HashSet<String>,
+    quarantine: &HashMap<String, u32>,
+    seconds: u32,
 ) {
     const ENUM_KEY: &str = "<enumeration>";
     let inputs = match audio::inputs(only) {
@@ -255,7 +282,7 @@ fn open_missing(
     };
     reported.remove(ENUM_KEY);
     for input in inputs {
-        if slots.contains_key(&input.name) {
+        if slots.contains_key(&input.name) || quarantine.get(&input.name).is_some_and(|&t| seconds < t) {
             continue;
         }
         let Some(prof) = cfg.devices.get(&input.name) else {
@@ -292,7 +319,14 @@ fn open_missing(
             Ok(stream) => {
                 println!("  listening on [{}] {}  (sim>{} tonal>{} min_rms={})", input.index,
                     input.name, prof.sim_t, prof.tonal_t, prof.min_rms);
-                slots.insert(input.name.clone(), Slot { index: input.index, stats, age: 0, _stream: stream });
+                slots.insert(input.name.clone(), Slot {
+                    index: input.index,
+                    stats,
+                    age: 0,
+                    silent: 0,
+                    minute_peak: 0.0,
+                    _stream: stream,
+                });
             }
             Err(e) => {
                 if reported.insert(input.name.clone()) {

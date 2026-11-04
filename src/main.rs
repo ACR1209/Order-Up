@@ -22,6 +22,30 @@ mod startup;
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn FreeConsole() -> i32;
+    fn SetStdHandle(std_handle: u32, handle: *mut std::ffi::c_void) -> i32;
+}
+
+const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+const MAX_LOG_BYTES: u64 = 512 * 1024;
+
+/// With no console, println!/eprintln! would vanish. Point them at %APPDATA%\orderup\orderup.log
+/// instead so a background run can be diagnosed. Best effort: on any failure, stay silent.
+fn redirect_output_to_log() {
+    use std::os::windows::io::IntoRawHandle;
+    let path = profile::app_dir().join("orderup.log");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_LOG_BYTES) {
+        let _ = std::fs::remove_file(&path);
+    }
+    let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+        return;
+    };
+    let handle = file.into_raw_handle(); // intentionally never closed: it lives as long as we do
+    // SAFETY: `handle` is a valid, open file handle that we leak on purpose.
+    unsafe {
+        SetStdHandle(STD_OUTPUT_HANDLE, handle);
+        SetStdHandle(STD_ERROR_HANDLE, handle);
+    }
 }
 
 /// Parses `--device N`.
@@ -65,6 +89,11 @@ fn run_listener(args: &[String]) -> Result<(), String> {
     if background {
         // SAFETY: plain Win32 call with no arguments; detaches us from the console.
         unsafe { FreeConsole() };
+        redirect_output_to_log();
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        println!("--- orderup started (unix time {unix}) ---");
     }
     listen::run(args, settings)
 }
